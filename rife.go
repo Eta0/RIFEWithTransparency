@@ -6,16 +6,19 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func main() {
 	errorLogger := log.New(os.Stderr, "", 0)
-	if len(os.Args) != 3 && len(os.Args) != 4 {
-		errorLogger.Fatal("usage: " + os.Args[0] + " input.gif output.png [#matte]")
+
+	nArgs := len(os.Args)
+	if nArgs < 2 || nArgs > 4 || strings.ToLower(os.Args[1]) == "-h" || strings.ToLower(os.Args[1]) == "--help" {
+		errorLogger.Fatal("usage: " + os.Args[0] + " input.gif [output.png|output.gif] [#matte]")
 	}
+
 	source, err := filepath.Abs(os.Args[1])
 	if err != nil {
 		errorLogger.Fatal("error recognizing input path:\n  ", err)
@@ -23,12 +26,19 @@ func main() {
 	if _, err = os.Stat(source); err != nil {
 		errorLogger.Fatal("error opening input file:\n  ", err)
 	}
-	dest, err := filepath.Abs(os.Args[2])
-	if err != nil {
-		errorLogger.Fatal("error recognizing output path:\n  ", err)
+
+	var dest string
+	if nArgs >= 3 {
+		dest, err = filepath.Abs(os.Args[2])
+		if err != nil {
+			errorLogger.Fatal("error recognizing output path:\n  ", err)
+		}
+	} else {
+		dest = strings.TrimSuffix(source, filepath.Ext(source)) + "-2x-Interpolated.gif"
 	}
+
 	var background string
-	if len(os.Args) == 4 {
+	if nArgs == 4 {
 		background = os.Args[3]
 	} else {
 		background = "#36393F"
@@ -42,8 +52,50 @@ func main() {
 	fmt.Printf("%s : %d frames -> %d frames\n", os.Args[1], frameCount, frameCount*2+1)
 }
 
+func findProgram(names ...string) (string, error) {
+	var lastErr error
+
+	for _, name := range names {
+		// Try searching the PATH
+		program, err := exec.LookPath(name)
+		if err == nil {
+			return program, nil
+		}
+		lastErr = err
+
+		// Try searching a dependencies directory
+		here := filepath.Dir(os.Args[0])
+		program, err = exec.LookPath(filepath.Join(here, "Dependencies", name))
+		if err == nil {
+			return program, nil
+		}
+	}
+
+	return "", lastErr
+}
+
 func interpolate(source, dest, background string) (uint64, error) {
 	// Interpolates the file at path `source`, outputting at path `dest`, with an intermediate matting colour specified by `background`.
+
+	isGif := strings.ToLower(filepath.Ext(dest)) == ".gif"
+
+	// Locate dependencies
+	magick, err := findProgram("magick")
+	if err != nil {
+		return 0, fmt.Errorf("error locating dependency:\n  %s", err)
+	}
+	rife, err := findProgram("rife", "rife-ncnn-vulkan")
+	if err != nil {
+		return 0, fmt.Errorf("error locating dependency:\n  %s", err)
+	}
+	apngasm, err := findProgram("apngasm64", "apngasm")
+	if err != nil {
+		return 0, fmt.Errorf("error locating dependency:\n  %s", err)
+	}
+	apng2gif, err := findProgram("apng2gif", "apngasm")
+	if err != nil && isGif {
+		return 0, fmt.Errorf("error locating dependency:\n  %s", err)
+	}
 
 	// Set up temporary directory structure
 
@@ -57,11 +109,11 @@ func interpolate(source, dest, background string) (uint64, error) {
 		return 0, fmt.Errorf("error opening temporary directory:\n  %s", err)
 	}
 
-	frameDir := path.Join(dir, "Frames")
-	alphaDir := path.Join(dir, "Alpha")
-	interpolatedFrameDir := path.Join(dir, "IFrames")
-	interpolatedAlphaDir := path.Join(dir, "IAlpha")
-	mergedDir := path.Join(dir, "Merged")
+	frameDir := filepath.Join(dir, "Frames")
+	alphaDir := filepath.Join(dir, "Alpha")
+	interpolatedFrameDir := filepath.Join(dir, "IFrames")
+	interpolatedAlphaDir := filepath.Join(dir, "IAlpha")
+	mergedDir := filepath.Join(dir, "Merged")
 
 	for _, childDir := range []string{frameDir, alphaDir, interpolatedFrameDir, interpolatedAlphaDir, mergedDir} {
 		err = os.Mkdir(childDir, 0600)
@@ -72,7 +124,7 @@ func interpolate(source, dest, background string) (uint64, error) {
 
 	// Get information about the source animation
 
-	output, err := exec.Command("magick", "identify", "-format", "%n %T ", source).Output()
+	output, err := exec.Command(magick, "identify", "-format", "%n %T ", source).Output()
 	if err != nil {
 		return 0, fmt.Errorf("error getting number of frames in source:\n  %s", err)
 	}
@@ -95,7 +147,7 @@ func interpolate(source, dest, background string) (uint64, error) {
 	errChannel := make(chan error)
 
 	go func(result chan error) {
-		localErr := exec.Command("magick", "convert", source, "-background", background, "-coalesce", "-alpha", "Background", "-alpha", "Off", "-strip", "-define", "png:color-type=2", path.Join(frameDir, inputPaddingSpecifier)).Run()
+		localErr := exec.Command(magick, "convert", source, "-background", background, "-coalesce", "-alpha", "Background", "-alpha", "Off", "-strip", "-define", "png:color-type=2", filepath.Join(frameDir, inputPaddingSpecifier)).Run()
 		if localErr != nil {
 			result <- fmt.Errorf("error extracting frames from source:\n  %s", localErr)
 			return
@@ -104,7 +156,7 @@ func interpolate(source, dest, background string) (uint64, error) {
 	}(errChannel)
 
 	go func(result chan error) {
-		localErr := exec.Command("magick", "convert", source, "-coalesce", "-alpha", "Extract", "-strip", "-define", "png:color-type=0", path.Join(alphaDir, inputPaddingSpecifier)).Run()
+		localErr := exec.Command(magick, "convert", source, "-coalesce", "-alpha", "Extract", "-strip", "-define", "png:color-type=0", filepath.Join(alphaDir, inputPaddingSpecifier)).Run()
 		if localErr != nil {
 			result <- fmt.Errorf("error extracting alpha from source frames:\n  %s", localErr)
 			return
@@ -119,8 +171,8 @@ func interpolate(source, dest, background string) (uint64, error) {
 	// Copy the first frame to the end, for smoother looping
 
 	for _, childDir := range []string{frameDir, alphaDir} {
-		firstFrame := path.Join(childDir, fmt.Sprintf(inputPaddingSpecifier, 0))
-		lastFrame := path.Join(childDir, fmt.Sprintf(inputPaddingSpecifier, frameCount))
+		firstFrame := filepath.Join(childDir, fmt.Sprintf(inputPaddingSpecifier, 0))
+		lastFrame := filepath.Join(childDir, fmt.Sprintf(inputPaddingSpecifier, frameCount))
 		err = os.Link(firstFrame, lastFrame)
 		if err != nil {
 			// Maybe hardlinking just isn't supported
@@ -138,7 +190,7 @@ func interpolate(source, dest, background string) (uint64, error) {
 	outputPaddingSpecifier := fmt.Sprintf("%%0%dd.png", len(strconv.FormatUint(finalFrameCount, 10)))
 
 	go func(result chan error) {
-		localErr := exec.Command("rife", "-m", "rife-v4.6", "-i", frameDir, "-o", interpolatedFrameDir, "-x", "-z", "-f", outputPaddingSpecifier).Run()
+		localErr := exec.Command(rife, "-m", "rife-v4.6", "-i", frameDir, "-o", interpolatedFrameDir, "-x", "-z", "-f", outputPaddingSpecifier).Run()
 		if localErr != nil {
 			result <- fmt.Errorf("error interpolating frames:\n  %s", localErr)
 			return
@@ -147,7 +199,7 @@ func interpolate(source, dest, background string) (uint64, error) {
 	}(errChannel)
 
 	go func(result chan error) {
-		localErr := exec.Command("rife", "-m", "rife-v4.6", "-i", alphaDir, "-o", interpolatedAlphaDir, "-x", "-z", "-f", outputPaddingSpecifier).Run()
+		localErr := exec.Command(rife, "-m", "rife-v4.6", "-i", alphaDir, "-o", interpolatedAlphaDir, "-x", "-z", "-f", outputPaddingSpecifier).Run()
 		if localErr != nil {
 			result <- fmt.Errorf("error interpolating alpha:\n  %s", localErr)
 			return
@@ -166,8 +218,8 @@ func interpolate(source, dest, background string) (uint64, error) {
 		go func(i uint64, result chan error) {
 			frameName := fmt.Sprintf(outputPaddingSpecifier, i)
 			localErr := exec.Command(
-				"magick", path.Join(interpolatedFrameDir, frameName), path.Join(interpolatedAlphaDir, frameName),
-				"-alpha", "Off", "-compose", "CopyOpacity", "-composite", path.Join(mergedDir, frameName),
+				magick, filepath.Join(interpolatedFrameDir, frameName), filepath.Join(interpolatedAlphaDir, frameName),
+				"-alpha", "Off", "-compose", "CopyOpacity", "-composite", filepath.Join(mergedDir, frameName),
 			).Run()
 			if localErr != nil {
 				result <- fmt.Errorf("error applying transparency to frames:\n  %s", localErr)
@@ -185,6 +237,14 @@ func interpolate(source, dest, background string) (uint64, error) {
 
 	// Assemble into an APNG
 
+	var apngDest string
+	if isGif {
+		// Only an intermediate step
+		apngDest = filepath.Join(dir, "anim.png")
+	} else {
+		apngDest = dest
+	}
+
 	var framerateNumerator, framerateDenominator string
 	if frameLength > 0 {
 		// GIF frame lengths are in multiples of 1/100 of a second,
@@ -196,9 +256,18 @@ func interpolate(source, dest, background string) (uint64, error) {
 		framerateNumerator = "1"
 		framerateDenominator = "10"
 	}
-	err = exec.Command("apngasm64", dest, path.Join(mergedDir, "*.png"), "-i30", framerateNumerator, framerateDenominator).Run()
+	err = exec.Command(apngasm, apngDest, filepath.Join(mergedDir, "*.png"), "-i30", framerateNumerator, framerateDenominator).Run()
 	if err != nil {
 		return 0, fmt.Errorf("error assembling APNG:\n  %s", err)
+	}
+
+	// Optionally convert to GIF
+
+	if isGif {
+		err = exec.Command(apng2gif, apngDest, dest).Run()
+		if err != nil {
+			return 0, fmt.Errorf("error converting APNG to GIF:\n  %s", err)
+		}
 	}
 
 	return frameCount, nil
